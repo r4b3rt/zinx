@@ -1,21 +1,28 @@
 package znet
 
 import (
+	"bufio"
 	"context"
 	"encoding/hex"
 	"errors"
 	"net"
+	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/aceld/zinx/zconf"
+	"github.com/aceld/zinx/ziface"
 	"github.com/aceld/zinx/zinterceptor"
 	"github.com/aceld/zinx/zlog"
 	"github.com/aceld/zinx/zpack"
-	"github.com/gorilla/websocket"
 
-	"github.com/aceld/zinx/ziface"
+	"github.com/gorilla/websocket"
 )
+
+// CallBackFunc defines the callback function type
+// (定义回调函数类型)
+type CallBackFunc func()
 
 // Connection TCP connection module
 // Used to handle the read and write business of TCP connections, one Connection corresponds to one connection
@@ -23,6 +30,9 @@ import (
 type Connection struct {
 	// // The socket TCP socket of the current connection(当前连接的socket TCP套接字)
 	conn net.Conn
+
+	// The buffer writer of the current connection(当前连接的写缓冲)
+	bufWriter *bufio.Writer
 
 	// The ID of the current connection, also known as SessionID, globally unique, used by server Connection
 	// uint64 range: 0~18,446,744,073,709,551,615
@@ -32,12 +42,20 @@ type Connection struct {
 	// 这个是理论支持的进程connID的最大数量)
 	connID uint64
 
+	// connection id for string
+	// (字符串的连接id)
+	connIdStr string
+
+	// The workerid responsible for handling the link
+	// 负责处理该连接的workerid
+	workerID uint32
+
 	// The message management module that manages MsgID and the corresponding processing method
 	// (消息管理MsgID和对应处理方法的消息管理模块)
 	msgHandler ziface.IMsgHandle
 
 	// Channel to notify that the connection has exited/stopped
-	// (告知该链接已经退出/停止的channel)
+	// (告知该连接已经退出/停止的channel)
 	ctx    context.Context
 	cancel context.CancelFunc
 
@@ -45,24 +63,22 @@ type Connection struct {
 	// (有缓冲管道，用于读、写两个goroutine之间的消息通信)
 	msgBuffChan chan []byte
 
-	// Lock for user message reception and transmission
-	// (用户收发消息的Lock)
-	msgLock sync.RWMutex
+	closeOnce sync.Once
+
+	// Go StartWriter Flag
+	// (开始初始化写协程标志)
+	startWriterFlag int32
 
 	// Connection properties
-	// (链接属性)
+	// (连接属性)
 	property map[string]interface{}
 
 	// Lock to protect the current property
 	// (保护当前property的锁)
 	propertyLock sync.Mutex
 
-	// The current connection's close state
-	// (当前连接的关闭状态)
-	isClosed bool
-
 	// Which Connection Manager the current connection belongs to
-	// (当前链接是属于哪个Connection Manager的)
+	// (当前连接是属于哪个Connection Manager的)
 	connManager ziface.IConnManager
 
 	// Hook function when the current connection is created
@@ -90,16 +106,22 @@ type Connection struct {
 	hc ziface.IHeartbeatChecker
 
 	// Connection name, default to be the same as the name of the Server/Client that created the connection
-	// (链接名称，默认与创建链接的Server/Client的Name一致)
+	// (连接名称，默认与创建连接的Server/Client的Name一致)
 	name string
 
 	// Local address of the current connection
-	// (当前链接的本地地址)
+	// (当前连接的本地地址)
 	localAddr string
 
 	// Remote address of the current connection
-	// (当前链接的远程地址)
+	// (当前连接的远程地址)
 	remoteAddr string
+
+	// Close callback
+	closeCallback callbacks
+
+	// Close callback mutex
+	closeCallbackMutex sync.RWMutex
 }
 
 // newServerConn :for Server, method to create a Server-side connection with Server-specific properties
@@ -108,14 +130,16 @@ func newServerConn(server ziface.IServer, conn net.Conn, connID uint64) ziface.I
 
 	// Initialize Conn properties
 	c := &Connection{
-		conn:        conn,
-		connID:      connID,
-		isClosed:    false,
-		msgBuffChan: nil,
-		property:    nil,
-		name:        server.ServerName(),
-		localAddr:   conn.LocalAddr().String(),
-		remoteAddr:  conn.RemoteAddr().String(),
+		conn:            conn,
+		bufWriter:       bufio.NewWriterSize(conn, 16*1024),
+		connID:          connID,
+		connIdStr:       strconv.FormatUint(connID, 10),
+		startWriterFlag: 0,
+		msgBuffChan:     nil,
+		property:        nil,
+		name:            server.ServerName(),
+		localAddr:       conn.LocalAddr().String(),
+		remoteAddr:      conn.RemoteAddr().String(),
 	}
 
 	lengthField := server.GetLengthField()
@@ -134,7 +158,7 @@ func newServerConn(server ziface.IServer, conn net.Conn, connID uint64) ziface.I
 	c.connManager = server.GetConnMgr()
 
 	// Add the newly created Conn to the connection manager
-	// (将新创建的Conn添加到链接管理中)
+	// (将新创建的Conn添加到连接管理中)
 	server.GetConnMgr().Add(c)
 
 	return c
@@ -144,14 +168,16 @@ func newServerConn(server ziface.IServer, conn net.Conn, connID uint64) ziface.I
 // (创建一个Client服务端特性的连接的方法)
 func newClientConn(client ziface.IClient, conn net.Conn) ziface.IConnection {
 	c := &Connection{
-		conn:        conn,
-		connID:      0, // client ignore
-		isClosed:    false,
-		msgBuffChan: nil,
-		property:    nil,
-		name:        client.GetName(),
-		localAddr:   conn.LocalAddr().String(),
-		remoteAddr:  conn.RemoteAddr().String(),
+		conn:            conn,
+		bufWriter:       bufio.NewWriterSize(conn, 16*1024),
+		connID:          0,  // client ignore
+		connIdStr:       "", // client ignore
+		startWriterFlag: 0,
+		msgBuffChan:     nil,
+		property:        nil,
+		name:            client.GetName(),
+		localAddr:       conn.LocalAddr().String(),
+		remoteAddr:      conn.RemoteAddr().String(),
 	}
 
 	lengthField := client.GetLengthField()
@@ -172,20 +198,43 @@ func newClientConn(client ziface.IClient, conn net.Conn) ziface.IConnection {
 // (写消息Goroutine， 用户将数据发送给客户端)
 func (c *Connection) StartWriter() {
 	zlog.Ins().InfoF("Writer Goroutine is running")
-	defer zlog.Ins().InfoF("%s [conn Writer exit!]", c.RemoteAddr().String())
-
+	defer func() {
+		zlog.Ins().InfoF("%s [conn Writer exit!]", c.RemoteAddr().String())
+		c.Flush()
+	}()
 	for {
 		select {
 		case data, ok := <-c.msgBuffChan:
-			if ok {
-				if _, err := c.conn.Write(data); err != nil {
-					zlog.Ins().ErrorF("Send Buff Data error:, %s Conn Writer exit", err)
-					break
-				}
-
-			} else {
+			if !ok {
 				zlog.Ins().ErrorF("msgBuffChan is Closed")
-				break
+				return
+			}
+
+			if err := c.SendBuf(data); err != nil {
+				zlog.Ins().ErrorF("Send Buff Data error:, %s Conn Writer exit", err)
+				return
+			}
+			// 一次性循环读出 msgBuffChan 中所有剩余数据
+		drainLoop:
+			for {
+				select {
+				case extra, ok2 := <-c.msgBuffChan:
+					if !ok2 {
+						zlog.Ins().ErrorF("msgBuffChan is Closed")
+						return
+					}
+					if err := c.SendBuf(extra); err != nil {
+						zlog.Ins().ErrorF("Send Buff Data error:, %s Conn Writer exit", err)
+						return
+					}
+				default:
+					break drainLoop
+				}
+			}
+			// 批量写入完成后一次性 flush
+			if err := c.Flush(); err != nil {
+				zlog.Ins().ErrorF("Flush Buff Data error: %v Conn Writer exit", err)
+				return
 			}
 		case <-c.ctx.Done():
 			return
@@ -198,26 +247,31 @@ func (c *Connection) StartWriter() {
 func (c *Connection) StartReader() {
 	zlog.Ins().InfoF("[Reader Goroutine is running]")
 	defer zlog.Ins().InfoF("%s [conn Reader exit!]", c.RemoteAddr().String())
-	defer c.Stop()
+	defer func() {
+		c.Stop()
+		c.doClose()
+	}()
 	defer func() {
 		if err := recover(); err != nil {
 			zlog.Ins().ErrorF("connID=%d, panic err=%v", c.GetConnID(), err)
 		}
 	}()
 
+	//Reduce buffer allocation times to improve efficiency
+	// add by ray 2023-02-03
+	buffer := make([]byte, zconf.GlobalObject.IOReadBuffSize)
+
 	for {
 		select {
 		case <-c.ctx.Done():
 			return
 		default:
-			// add by uuxia 2023-02-03
-			buffer := make([]byte, zconf.GlobalObject.IOReadBuffSize)
 
 			// read data from the connection's IO into the memory buffer
 			// (从conn的IO中读取数据到内存缓冲buffer中)
 			n, err := c.conn.Read(buffer)
 			if err != nil {
-				zlog.Ins().ErrorF("read msg head [read datalen=%d], error = %s", n, err)
+				zlog.Ins().ErrorF("read msg head [read datalen=%d], error = %s", n, err) // 不需要发 Log,正常关闭
 				return
 			}
 			zlog.Ins().DebugF("read buffer %s \n", hex.EncodeToString(buffer[0:n]))
@@ -238,18 +292,18 @@ func (c *Connection) StartReader() {
 					continue
 				}
 				for _, bytes := range bufArrays {
-					//zlog.Ins().DebugF("read buffer %s \n", hex.EncodeToString(bytes))
+					// zlog.Ins().DebugF("read buffer %s \n", hex.EncodeToString(bytes))
 					msg := zpack.NewMessage(uint32(len(bytes)), bytes)
 					// Get the current client's Request data
 					// (得到当前客户端请求的Request数据)
-					req := NewRequest(c, msg)
+					req := GetRequest(c, msg)
 					c.msgHandler.Execute(req)
 				}
 			} else {
 				msg := zpack.NewMessage(uint32(n), buffer[0:n])
 				// Get the current client's Request data
 				// (得到当前客户端请求的Request数据)
-				req := NewRequest(c, msg)
+				req := GetRequest(c, msg)
 				c.msgHandler.Execute(req)
 			}
 		}
@@ -276,15 +330,15 @@ func (c *Connection) Start() {
 		c.updateActivity()
 	}
 
+	// 占用workerid
+	c.workerID = useWorker(c)
+
 	// Start the Goroutine for reading data from the client
 	// (开启用户从客户端读取数据流程的Goroutine)
 	go c.StartReader()
 
-	select {
-	case <-c.ctx.Done():
-		c.finalizer()
-		return
-	}
+	// 直接退出，让 StartReader协程 来处理关闭逻辑
+
 }
 
 // Stop stops the connection and ends the current connection state.
@@ -310,6 +364,14 @@ func (c *Connection) GetConnID() uint64 {
 	return c.connID
 }
 
+func (c *Connection) GetConnIdStr() string {
+	return c.connIdStr
+}
+
+func (c *Connection) GetWorkerID() uint32 {
+	return c.workerID
+}
+
 func (c *Connection) RemoteAddr() net.Addr {
 	return c.conn.RemoteAddr()
 }
@@ -318,27 +380,40 @@ func (c *Connection) LocalAddr() net.Addr {
 	return c.conn.LocalAddr()
 }
 
+func (c *Connection) Flush() error {
+	if c.isClosed() == true {
+		return errors.New("connection closed when flush data")
+	}
+	return c.bufWriter.Flush()
+}
+
 func (c *Connection) Send(data []byte) error {
-	c.msgLock.RLock()
-	defer c.msgLock.RUnlock()
-	if c.isClosed == true {
+	if c.isClosed() == true {
 		return errors.New("connection closed when send msg")
 	}
-
 	_, err := c.conn.Write(data)
 	if err != nil {
 		zlog.Ins().ErrorF("SendMsg err data = %+v, err = %+v", data, err)
 		return err
 	}
-
 	return nil
 }
 
-func (c *Connection) SendToQueue(data []byte) error {
-	c.msgLock.RLock()
-	defer c.msgLock.RUnlock()
+func (c *Connection) SendBuf(data []byte) error {
+	if c.isClosed() == true {
+		return errors.New("connection closed when send msg")
+	}
+	_, err := c.bufWriter.Write(data)
+	if err != nil {
+		zlog.Ins().ErrorF("SendMsg err data = %+v, err = %+v", data, err)
+		return err
+	}
+	return nil
+}
 
-	if c.msgBuffChan == nil {
+func (c *Connection) SendToQueue(data []byte, opts ...ziface.MsgSendOption) error {
+
+	if c.msgBuffChan == nil && c.setStartWriterFlag() {
 		c.msgBuffChan = make(chan []byte, zconf.GlobalObject.MaxMsgChanLen)
 		// Start a Goroutine to write data back to the client
 		// This method only reads data from the MsgBuffChan without allocating memory or starting a Goroutine
@@ -347,10 +422,7 @@ func (c *Connection) SendToQueue(data []byte) error {
 		go c.StartWriter()
 	}
 
-	idleTimeout := time.NewTimer(5 * time.Millisecond)
-	defer idleTimeout.Stop()
-
-	if c.isClosed == true {
+	if c.isClosed() == true {
 		return errors.New("Connection closed when send buff msg")
 	}
 
@@ -361,22 +433,28 @@ func (c *Connection) SendToQueue(data []byte) error {
 
 	// Send timeout
 	select {
-	case <-idleTimeout.C:
-		return errors.New("send buff msg timeout")
+	case <-c.ctx.Done():
+		// Close all channels associated with the connection
+		// Close Once to avoid repeated closure
+		c.closeOnce.Do(func() {
+			close(c.msgBuffChan)
+		})
+		return errors.New("connection closed when send buff msg")
 	case c.msgBuffChan <- data:
 		return nil
+	default:
+		zlog.Ins().ErrorF("send buff msg channel is full")
+		return errors.New("send buff msg channel is full")
 	}
 }
 
 // SendMsg directly sends Message data to the remote TCP client.
 // (直接将Message数据发送数据给远程的TCP客户端)
 func (c *Connection) SendMsg(msgID uint32, data []byte) error {
-	c.msgLock.RLock()
-	defer c.msgLock.RUnlock()
-	if c.isClosed == true {
+
+	if c.isClosed() == true {
 		return errors.New("connection closed when send msg")
 	}
-
 	// Pack data and send it
 	msg, err := c.packet.Pack(zpack.NewMsgPackage(msgID, data))
 	if err != nil {
@@ -384,7 +462,7 @@ func (c *Connection) SendMsg(msgID uint32, data []byte) error {
 		return errors.New("Pack error msg ")
 	}
 
-	_, err = c.conn.Write(msg)
+	err = c.Send(msg)
 	if err != nil {
 		zlog.Ins().ErrorF("SendMsg err msg ID = %d, data = %+v, err = %+v", msgID, string(msg), err)
 		return err
@@ -393,39 +471,14 @@ func (c *Connection) SendMsg(msgID uint32, data []byte) error {
 	return nil
 }
 
-func (c *Connection) SendBuffMsg(msgID uint32, data []byte) error {
-	c.msgLock.RLock()
-	defer c.msgLock.RUnlock()
-
-	if c.msgBuffChan == nil {
-		c.msgBuffChan = make(chan []byte, zconf.GlobalObject.MaxMsgChanLen)
-		// Start a Goroutine to write data back to the client
-		// This method only reads data from the MsgBuffChan without allocating memory or starting a Goroutine
-		// (开启用于写回客户端数据流程的Goroutine
-		// 此方法只读取MsgBuffChan中的数据没调用SendBuffMsg可以分配内存和启用协程)
-		go c.StartWriter()
-	}
-
-	idleTimeout := time.NewTimer(5 * time.Millisecond)
-	defer idleTimeout.Stop()
-
-	if c.isClosed == true {
-		return errors.New("Connection closed when send buff msg")
-	}
-
+func (c *Connection) SendBuffMsg(msgID uint32, data []byte, opts ...ziface.MsgSendOption) error {
 	msg, err := c.packet.Pack(zpack.NewMsgPackage(msgID, data))
 	if err != nil {
 		zlog.Ins().ErrorF("Pack error msg ID = %d", msgID)
 		return errors.New("Pack error msg ")
 	}
+	return c.SendToQueue(msg, opts...)
 
-	// send timeout
-	select {
-	case <-idleTimeout.C:
-		return errors.New("send buff msg timeout")
-	case c.msgBuffChan <- msg:
-		return nil
-	}
 }
 
 func (c *Connection) SetProperty(key string, value interface{}) {
@@ -462,16 +515,8 @@ func (c *Connection) Context() context.Context {
 
 func (c *Connection) finalizer() {
 	// Call the callback function registered by the user when closing the connection if it exists
-	// (如果用户注册了该链接的	关闭回调业务，那么在此刻应该显示调用)
+	// (如果用户注册了该连接的	关闭回调业务，那么在此刻应该显示调用)
 	c.callOnConnStop()
-
-	c.msgLock.Lock()
-	defer c.msgLock.Unlock()
-
-	// If the connection has already been closed
-	if c.isClosed == true {
-		return
-	}
 
 	// Stop the heartbeat detector associated with the connection
 	if c.hc != nil {
@@ -486,12 +531,15 @@ func (c *Connection) finalizer() {
 		c.connManager.Remove(c)
 	}
 
-	// Close all channels associated with the connection
-	if c.msgBuffChan != nil {
-		close(c.msgBuffChan)
-	}
+	go func() {
+		defer func() {
+			if err := recover(); err != nil {
+				zlog.Ins().ErrorF("Conn finalizer panic: %v", err)
+			}
+		}()
 
-	c.isClosed = true
+		c.InvokeCloseCallbacks()
+	}()
 
 	zlog.Ins().InfoF("Conn Stop()...ConnID = %d", c.connID)
 }
@@ -511,7 +559,7 @@ func (c *Connection) callOnConnStop() {
 }
 
 func (c *Connection) IsAlive() bool {
-	if c.isClosed {
+	if c.isClosed() {
 		return false
 	}
 	// Check the last activity time of the connection. If it's beyond the heartbeat interval,
@@ -542,4 +590,42 @@ func (c *Connection) GetName() string {
 
 func (c *Connection) GetMsgHandler() ziface.IMsgHandle {
 	return c.msgHandler
+}
+
+func (c *Connection) isClosed() bool {
+	return c.ctx == nil || c.ctx.Err() != nil
+}
+
+func (c *Connection) setStartWriterFlag() bool {
+	return atomic.CompareAndSwapInt32(&c.startWriterFlag, 0, 1)
+}
+
+func (s *Connection) AddCloseCallback(handler, key interface{}, f func()) {
+	if s.isClosed() {
+		return
+	}
+	s.closeCallbackMutex.Lock()
+	defer s.closeCallbackMutex.Unlock()
+	s.closeCallback.Add(handler, key, f)
+}
+
+func (s *Connection) RemoveCloseCallback(handler, key interface{}) {
+	if s.isClosed() {
+		return
+	}
+	s.closeCallbackMutex.Lock()
+	defer s.closeCallbackMutex.Unlock()
+	s.closeCallback.Remove(handler, key)
+}
+
+func (s *Connection) InvokeCloseCallbacks() {
+	s.closeCallbackMutex.RLock()
+	defer s.closeCallbackMutex.RUnlock()
+	s.closeCallback.Invoke()
+}
+
+func (s *Connection) doClose() {
+	s.finalizer()
+	// 归还workerid
+	freeWorker(s)
 }

@@ -10,13 +10,17 @@ import (
 	"os"
 	"os/signal"
 	"sync/atomic"
+	"syscall"
 	"time"
+
+	"github.com/gorilla/websocket"
 
 	"github.com/aceld/zinx/logo"
 	"github.com/aceld/zinx/zconf"
 	"github.com/aceld/zinx/zdecoder"
 	"github.com/aceld/zinx/zlog"
-	"github.com/gorilla/websocket"
+
+	"github.com/xtaci/kcp-go"
 
 	"github.com/aceld/zinx/ziface"
 	"github.com/aceld/zinx/zpack"
@@ -35,6 +39,10 @@ type Server struct {
 	Port int
 	// 服务绑定的websocket 端口 (Websocket port the server is bound to)
 	WsPort int
+	// 服务绑定的websocket 路径 (Websocket path the server is bound to)
+	WsPath string
+	// 服务绑定的kcp 端口 (kcp port the server is bound to)
+	KcpPort int
 
 	// Current server's message handler module, used to bind MsgID to corresponding processing methods
 	// (当前Server的消息管理模块，用来绑定MsgID和对应的处理方法)
@@ -42,8 +50,9 @@ type Server struct {
 
 	// Routing mode (路由模式)
 	RouterSlicesMode bool
-
-	// Current server's connection manager (当前Server的链接管理器)
+	// Request 对象池模式
+	RequestPoolMode bool
+	// Current server's connection manager (当前Server的连接管理器)
 	ConnMgr ziface.IConnManager
 
 	// Hook function called when a new connection is established
@@ -59,7 +68,7 @@ type Server struct {
 	packet ziface.IDataPack
 
 	// Asynchronous capture of connection closing status
-	// (异步捕获链接关闭状态)
+	// (异步捕获连接关闭状态)
 	exitChan chan struct{}
 
 	// Decoder for dealing with message fragmentation and reassembly
@@ -76,8 +85,43 @@ type Server struct {
 	// websocket connection authentication
 	websocketAuth func(r *http.Request) error
 
+	kcpConfig *KcpConfig
+
 	// connection id
 	cID uint64
+}
+
+type KcpConfig struct {
+	// changes ack flush option, set true to flush ack immediately,
+	// (改变ack刷新选项，设置为true立即刷新ack)
+	KcpACKNoDelay bool
+	// toggles the stream mode on/off
+	// (切换流模式开/关)
+	KcpStreamMode bool
+	// Whether nodelay mode is enabled, 0 is not enabled; 1 enabled.
+	// (是否启用nodelay模式，0不启用；1启用)
+	KcpNoDelay int
+	// Protocol internal work interval, in milliseconds, such as 10 ms or 20 ms.
+	// (协议内部工作的间隔，单位毫秒，比如10ms或者20ms)
+	KcpInterval int
+	// Fast retransmission mode, 0 represents off by default, 2 can be set (2 ACK spans will result in direct retransmission)
+	// (快速重传模式，默认为0关闭，可以设置2（2次ACK跨越将会直接重传）
+	KcpResend int
+	// Whether to turn off flow control, 0 represents “Do not turn off” by default, 1 represents “Turn off”.
+	// (是否关闭流控，默认是0代表不关闭，1代表关闭)
+	KcpNc int
+	// SND_BUF, this unit is the packet, default 32.
+	// (SND_BUF发送缓冲区大小，单位是包，默认是32)
+	KcpSendWindow int
+	// RCV_BUF, this unit is the packet, default 32.
+	// (RCV_BUF接收缓冲区大小，单位是包，默认是32)
+	KcpRecvWindow int
+	// FEC data shards, default 0.
+	// (FEC数据分片,用于前向纠错比例配制) 默认是0
+	KcpFecDataShards int
+	// FEC parity shards, default 0.
+	// (FEC校验分片,用于前向纠错比例配制) 默认是0
+	KcpFecParityShards int
 }
 
 // newServerWithConfig creates a server handle based on config
@@ -91,8 +135,11 @@ func newServerWithConfig(config *zconf.Config, ipVersion string, opts ...Option)
 		IP:               config.Host,
 		Port:             config.TCPPort,
 		WsPort:           config.WsPort,
+		WsPath:           config.WsPath,
+		KcpPort:          config.KcpPort,
 		msgHandler:       newMsgHandle(),
 		RouterSlicesMode: config.RouterSlicesMode,
+		RequestPoolMode:  config.RequestPoolMode,
 		ConnMgr:          newConnManager(),
 		exitChan:         nil,
 		// Default to using Zinx's TLV data pack format
@@ -104,6 +151,18 @@ func newServerWithConfig(config *zconf.Config, ipVersion string, opts ...Option)
 			CheckOrigin: func(r *http.Request) bool {
 				return true
 			},
+		},
+		kcpConfig: &KcpConfig{
+			KcpACKNoDelay:      config.KcpACKNoDelay,
+			KcpStreamMode:      config.KcpStreamMode,
+			KcpNoDelay:         config.KcpNoDelay,
+			KcpInterval:        config.KcpInterval,
+			KcpResend:          config.KcpResend,
+			KcpNc:              config.KcpNc,
+			KcpSendWindow:      config.KcpSendWindow,
+			KcpRecvWindow:      config.KcpRecvWindow,
+			KcpFecDataShards:   config.KcpFecDataShards,
+			KcpFecParityShards: config.KcpFecParityShards,
 		},
 	}
 
@@ -132,7 +191,7 @@ func NewUserConfServer(config *zconf.Config, opts ...Option) ziface.IServer {
 	// (刷新用户配置到全局配置变量)
 	zconf.UserConfToGlobal(config)
 
-	s := newServerWithConfig(config, "tcp4", opts...)
+	s := newServerWithConfig(zconf.GlobalObject, "tcp4", opts...)
 	return s
 }
 
@@ -145,7 +204,7 @@ func NewDefaultRouterSlicesServer(opts ...Option) ziface.IServer {
 	return s
 }
 
-// NewUserRouterSlicesServer creates a server handle with user-configured options and a default Recover handler.
+// NewUserConfDefaultRouterSlicesServer creates a server handle with user-configured options and a default Recover handler.
 // If the user does not wish to use the Use method, they should use NewUserConfServer instead.
 // (创建一个用户配置的自带一个Recover处理器的服务器句柄，如果用户不希望Use这个方法，那么应该使用NewUserConfServer)
 func NewUserConfDefaultRouterSlicesServer(config *zconf.Config, opts ...Option) ziface.IServer {
@@ -177,6 +236,7 @@ func (s *Server) StartConn(conn ziface.IConnection) {
 }
 
 func (s *Server) ListenTcpConn() {
+	zlog.Ins().InfoF("[START] TCP Server name: %s,listener at IP: %s, Port %d is starting", s.Name, s.IP, s.Port)
 	// 1. Get a TCP address
 	addr, err := net.ResolveTCPAddr(s.IPVersion, fmt.Sprintf("%s:%d", s.IP, s.Port))
 	if err != nil {
@@ -223,7 +283,7 @@ func (s *Server) ListenTcpConn() {
 			// (阻塞等待客户端建立连接请求)
 			conn, err := listener.Accept()
 			if err != nil {
-				//Go 1.16+
+				//Go 1.17+
 				if errors.Is(err, net.ErrClosed) {
 					zlog.Ins().ErrorF("Listener closed")
 					return
@@ -254,8 +314,9 @@ func (s *Server) ListenTcpConn() {
 }
 
 func (s *Server) ListenWebsocketConn() {
-
-	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+	zlog.Ins().InfoF("[START] WEBSOCKET Server name: %s,listener at IP: %s, Port %d, Path %s is starting", s.Name, s.IP, s.WsPort, s.WsPath)
+	mux := http.NewServeMux()
+	mux.HandleFunc(s.WsPath, func(w http.ResponseWriter, r *http.Request) {
 		// 1. Check if the server has reached the maximum allowed number of connections
 		// (设置服务器最大连接控制,如果超过最大连接，则等待)
 		if s.ConnMgr.Len() >= zconf.GlobalObject.MaxConn {
@@ -292,27 +353,89 @@ func (s *Server) ListenWebsocketConn() {
 		// 5. Handle the business logic of the new connection, which should already be bound to a handler and conn
 		// 5. 处理该新连接请求的 业务 方法， 此时应该有 handler 和 conn是绑定的
 		newCid := atomic.AddUint64(&s.cID, 1)
-		wsConn := newWebsocketConn(s, conn, newCid)
+		wsConn := newWebsocketConn(s, conn, newCid, r)
 		go s.StartConn(wsConn)
 
 	})
 
-	err := http.ListenAndServe(fmt.Sprintf("%s:%d", s.IP, s.WsPort), nil)
+	if zconf.GlobalObject.CertFile != "" && zconf.GlobalObject.PrivateKeyFile != "" {
+		err := http.ListenAndServeTLS(fmt.Sprintf("%s:%d", s.IP, s.WsPort), zconf.GlobalObject.CertFile, zconf.GlobalObject.PrivateKeyFile, mux)
+		if err != nil {
+			panic(err)
+		}
+	} else {
+		err := http.ListenAndServe(fmt.Sprintf("%s:%d", s.IP, s.WsPort), mux)
+		if err != nil {
+			panic(err)
+		}
+	}
+
+}
+
+func (s *Server) ListenKcpConn() {
+
+	// 1. Listen to the server address
+	listener, err := kcp.ListenWithOptions(fmt.Sprintf("%s:%d", s.IP, s.KcpPort), nil, s.kcpConfig.KcpFecDataShards, s.kcpConfig.KcpFecParityShards)
 	if err != nil {
-		panic(err)
+		zlog.Ins().ErrorF("[START] resolve KCP addr err: %v\n", err)
+		return
+	}
+
+	zlog.Ins().InfoF("[START] KCP server listening at IP: %s, Port %d, Addr %s", s.IP, s.KcpPort, listener.Addr().String())
+	// 2. Start server network connection business
+	go func() {
+		for {
+			// 2.1 Set the maximum connection control for the server. If it exceeds the maximum connection, wait.
+			// (设置服务器最大连接控制,如果超过最大连接，则等待)
+			if s.ConnMgr.Len() >= zconf.GlobalObject.MaxConn {
+				zlog.Ins().InfoF("Exceeded the maxConnNum:%d, Wait:%d", zconf.GlobalObject.MaxConn, AcceptDelay.duration)
+				AcceptDelay.Delay()
+				continue
+			}
+			// 2.2 Block and wait for a client to establish a connection request.
+			// (阻塞等待客户端建立连接请求)
+			conn, err := listener.Accept()
+			if err != nil {
+				zlog.Ins().ErrorF("Accept KCP err: %v", err)
+				AcceptDelay.Delay()
+				continue
+			}
+
+			AcceptDelay.Reset()
+
+			// 3.4 Handle the business method for this new connection request. At this time, the handler and conn should be bound.
+			// (处理该新连接请求的 业务 方法， 此时应该有 handler 和 conn 是绑定的)
+			newCid := atomic.AddUint64(&s.cID, 1)
+
+			kcpConn := conn.(*kcp.UDPSession)
+			kcpConn.SetACKNoDelay(s.kcpConfig.KcpACKNoDelay)
+			kcpConn.SetStreamMode(s.kcpConfig.KcpStreamMode)
+			kcpConn.SetNoDelay(s.kcpConfig.KcpNoDelay, s.kcpConfig.KcpInterval, s.kcpConfig.KcpResend, s.kcpConfig.KcpNc)
+			kcpConn.SetWindowSize(s.kcpConfig.KcpSendWindow, s.kcpConfig.KcpRecvWindow)
+
+			dealConn := newKcpServerConn(s, kcpConn, newCid)
+
+			go s.StartConn(dealConn)
+		}
+	}()
+	select {
+	case <-s.exitChan:
+		err := listener.Close()
+		if err != nil {
+			zlog.Ins().ErrorF("KCP listener close err: %v", err)
+		}
 	}
 }
 
 // Start the network service
 // (开启网络服务)
 func (s *Server) Start() {
-	zlog.Ins().InfoF("[START] Server name: %s,listener at IP: %s, Port %d is starting", s.Name, s.IP, s.Port)
 	s.exitChan = make(chan struct{})
 
-	// Add decoder to interceptors
-	// (将解码器添加到拦截器)
+	// Add decoder to interceptors head
+	// (将解码器添加到拦截器最前面)
 	if s.decoder != nil {
-		s.msgHandler.AddInterceptor(s.decoder)
+		s.msgHandler.SetHeadInterceptor(s.decoder)
 	}
 	// Start worker pool mechanism
 	// (启动worker工作池机制)
@@ -325,6 +448,8 @@ func (s *Server) Start() {
 		go s.ListenTcpConn()
 	case zconf.ServerModeWebsocket:
 		go s.ListenWebsocketConn()
+	case zconf.ServerModeKcp:
+		go s.ListenKcpConn()
 	default:
 		go s.ListenTcpConn()
 		go s.ListenWebsocketConn()
@@ -339,7 +464,6 @@ func (s *Server) Stop() {
 	// Clear other connection information or other information that needs to be cleaned up
 	// (将其他需要清理的连接信息或者其他信息 也要一并停止或者清理)
 	s.ConnMgr.ClearConn()
-	s.exitChan <- struct{}{}
 	close(s.exitChan)
 }
 
@@ -349,7 +473,7 @@ func (s *Server) Serve() {
 	// Block, otherwise the listener's goroutine will exit when the main Go exits (阻塞,否则主Go退出， listenner的go将会退出)
 	c := make(chan os.Signal, 1)
 	// Listen for specified signals: ctrl+c or kill signal (监听指定信号 ctrl+c kill信号)
-	signal.Notify(c, os.Interrupt, os.Kill)
+	signal.Notify(c, syscall.SIGINT, syscall.SIGTERM)
 	sig := <-c
 	zlog.Ins().InfoF("[SERVE] Zinx server , name %s, Serve Interrupt, signal = %v", s.Name, sig)
 }
@@ -433,7 +557,7 @@ func (s *Server) StartHeartBeat(interval time.Duration) {
 	s.hc = checker
 }
 
-// StartHeartBeatWithFunc starts the heartbeat detection with the given configuration.
+// StartHeartBeatWithOption starts the heartbeat detection with the given configuration.
 // interval is the time interval for sending heartbeat messages.
 // option is the configuration for heartbeat detection.
 // 启动心跳检测
@@ -447,9 +571,9 @@ func (s *Server) StartHeartBeatWithOption(interval time.Duration, option *ziface
 		checker.SetOnRemoteNotAlive(option.OnRemoteNotAlive)
 		//检测当前路由模式
 		if s.RouterSlicesMode {
-			checker.BindRouterSlices(option.HeadBeatMsgID, option.RouterSlices...)
+			checker.BindRouterSlices(option.HeartBeatMsgID, option.RouterSlices...)
 		} else {
-			checker.BindRouter(option.HeadBeatMsgID, option.Router)
+			checker.BindRouter(option.HeartBeatMsgID, option.Router)
 		}
 	}
 

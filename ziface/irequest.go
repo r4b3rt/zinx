@@ -10,11 +10,9 @@ type IFuncRequest interface {
 	CallFunc()
 }
 
-/*
-IRequest interface:
-	It actually packages the connection information and request data of the client request into Request
-	(实际上是把客户端请求的链接信息 和 请求的数据 包装到了 Request里)
-*/
+// IRequest interface:
+// It actually packages the connection information and request data of the client request into Request
+// (实际上是把客户端请求的连接信息 和 请求的数据 包装到了 Request里)
 type IRequest interface {
 	GetConnection() IConnection // Get the connection information of the request(获取请求连接信息)
 
@@ -48,6 +46,15 @@ type IRequest interface {
 	// Execute the next function
 	// (执行下一个函数)
 	RouterSlicesNext()
+
+	// 重置一个 Request
+	//Reset(conn IConnection, msg IMessage)
+	// 复制一份 Request 对象
+	Copy() IRequest
+	//Set 在 Request 中存放一个上下文
+	Set(key string, value interface{})
+	//Get 从 Request 中获取一个上下文信息
+	Get(key string) (value interface{}, exists bool)
 }
 
 type BaseRequest struct{}
@@ -64,3 +71,8 @@ func (br *BaseRequest) Abort()                           {}
 func (br *BaseRequest) Goto(HandleStep)                  {}
 func (br *BaseRequest) BindRouterSlices([]RouterHandler) {}
 func (br *BaseRequest) RouterSlicesNext()                {}
+func (br *BaseRequest) Copy() IRequest                   { return nil }
+
+func (br *BaseRequest) Set(key string, value interface{}) {}
+
+func (br *BaseRequest) Get(key string) (value interface{}, exists bool) { return nil, false }

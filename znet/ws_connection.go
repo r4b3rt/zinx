@@ -5,6 +5,8 @@ import (
 	"encoding/hex"
 	"errors"
 	"net"
+	"net/http"
+	"strconv"
 	"sync"
 	"time"
 
@@ -15,6 +17,9 @@ import (
 	"github.com/aceld/zinx/zpack"
 	"github.com/gorilla/websocket"
 )
+
+// WsConnectionHttpReqCtxKey http请求上下文key
+type WsConnectionHttpReqCtxKey struct{}
 
 // WsConnection is a module for handling the read and write operations of a WebSocket connection.
 // (Websocket连接模块, 用于处理 Websocket 连接的读写业务 一个连接对应一个Connection)
@@ -30,12 +35,20 @@ type WsConnection struct {
 	//  这个是理论支持的进程connID的最大数量)
 	connID uint64
 
+	// connection id for string
+	// (字符串的连接id)
+	connIdStr string
+
+	// The workerid responsible for handling the link
+	// 负责处理该连接的workerid
+	workerID uint32
+
 	// msgHandler is the message management module for MsgID and the corresponding message handling method.
 	// (消息管理MsgID和对应处理方法的消息管理模块)
 	msgHandler ziface.IMsgHandle
 
 	// ctx and cancel are used to notify that the connection has exited/stopped.
-	// (告知该链接已经退出/停止的channel)
+	// (告知该连接已经退出/停止的channel)
 	ctx    context.Context
 	cancel context.CancelFunc
 
@@ -45,9 +58,9 @@ type WsConnection struct {
 
 	// msgLock is used for locking when users send and receive messages.
 	// (用户收发消息的Lock)
-	msgLock sync.RWMutex
+	msgLock sync.Mutex
 
-	// property is the connection attribute. (链接属性)
+	// property is the connection attribute. (连接属性)
 	property map[string]interface{}
 
 	// propertyLock protects the current property lock. (保护当前property的锁)
@@ -56,7 +69,7 @@ type WsConnection struct {
 	// isClosed is the current connection's closed state. (当前连接的关闭状态)
 	isClosed bool
 
-	// connManager is the Connection Manager to which the current connection belongs. (当前链接是属于哪个Connection Manager的)
+	// connManager is the Connection Manager to which the current connection belongs. (当前连接是属于哪个Connection Manager的)
 	connManager ziface.IConnManager
 
 	// onConnStart is the Hook function when the current connection is created.
@@ -83,25 +96,33 @@ type WsConnection struct {
 	hc ziface.IHeartbeatChecker
 
 	// name is the name of the connection and is the same as the Name of the Server/Client that created the connection.
-	// (链接名称，默认与创建链接的Server/Client的Name一致)
+	// (连接名称，默认与创建连接的Server/Client的Name一致)
 	name string
 
-	// localAddr is the local address of the current connection. (当前链接的本地地址)
+	// localAddr is the local address of the current connection. (当前连接的本地地址)
 	localAddr string
 
-	// remoteAddr is the remote address of the current connection. (当前链接的远程地址)
+	// remoteAddr is the remote address of the current connection. (当前连接的远程地址)
 	remoteAddr string
+
+	// Close callback
+	closeCallback callbacks
+
+	// Close callback mutex
+	closeCallbackMutex sync.RWMutex
 }
 
 // newServerConn: for Server, a method to create a connection with Server characteristics
 // Note: The name has been changed from NewConnection
 // (newServerConn :for Server, 创建一个Server服务端特性的连接的方法
 // Note: 名字由 NewConnection 更变)
-func newWebsocketConn(server ziface.IServer, conn *websocket.Conn, connID uint64) ziface.IConnection {
+func newWebsocketConn(server ziface.IServer, conn *websocket.Conn, connID uint64, r *http.Request) ziface.IConnection {
 	// Initialize Conn properties (初始化Conn属性)
 	c := &WsConnection{
+		ctx:         context.WithValue(context.Background(), WsConnectionHttpReqCtxKey{}, r.Context()), // websocketAuth可以在上下文中传递特殊的参数或信息;比如鉴权后，设置一些用户信息或房间id
 		conn:        conn,
 		connID:      connID,
+		connIdStr:   strconv.FormatUint(connID, 10),
 		isClosed:    false,
 		msgBuffChan: nil,
 		property:    nil,
@@ -124,7 +145,7 @@ func newWebsocketConn(server ziface.IServer, conn *websocket.Conn, connID uint64
 	// Bind the current Connection to the Server's ConnManager (将当前的Connection与Server的ConnManager绑定)
 	c.connManager = server.GetConnMgr()
 
-	// Add the newly created Conn to the connection management (将新创建的Conn添加到链接管理中)
+	// Add the newly created Conn to the connection management (将新创建的Conn添加到连接管理中)
 	server.GetConnMgr().Add(c)
 
 	return c
@@ -135,7 +156,8 @@ func newWebsocketConn(server ziface.IServer, conn *websocket.Conn, connID uint64
 func newWsClientConn(client ziface.IClient, conn *websocket.Conn) ziface.IConnection {
 	c := &WsConnection{
 		conn:        conn,
-		connID:      0, //client ignore
+		connID:      0,  // client ignore
+		connIdStr:   "", // client ignore
 		isClosed:    false,
 		msgBuffChan: nil,
 		property:    nil,
@@ -168,7 +190,7 @@ func (c *WsConnection) StartWriter() {
 		select {
 		case data, ok := <-c.msgBuffChan:
 			if ok {
-				if err := c.conn.WriteMessage(websocket.BinaryMessage, data); err != nil {
+				if err := c.Send(data); err != nil {
 					zlog.Ins().ErrorF("Send Buff Data error:, %s Conn Writer exit", err)
 					break
 				}
@@ -196,8 +218,8 @@ func (c *WsConnection) StartReader() {
 		case <-c.ctx.Done():
 			return
 		default:
-			//add by uuxia 2023-02-03
-			//Read data from the conn's IO to the memory buffer.
+			// add by uuxia 2023-02-03
+			// Read data from the conn's IO to the memory buffer.
 			// (从conn的IO中读取数据到内存缓冲buffer中)
 			messageType, buffer, err := c.conn.ReadMessage()
 			if err != nil {
@@ -211,7 +233,6 @@ func (c *WsConnection) StartReader() {
 			n := len(buffer)
 			if err != nil {
 				zlog.Ins().ErrorF("read msg head [read datalen=%d], error = %s", n, err.Error())
-
 				return
 			}
 			zlog.Ins().DebugF("read buffer %s \n", hex.EncodeToString(buffer[0:n]))
@@ -236,14 +257,14 @@ func (c *WsConnection) StartReader() {
 					msg := zpack.NewMessage(uint32(len(bytes)), bytes)
 					// Get the Request data requested by the current client.
 					// (得到当前客户端请求的Request数据)
-					req := NewRequest(c, msg)
+					req := GetRequest(c, msg)
 					c.msgHandler.Execute(req)
 				}
 			} else {
 				msg := zpack.NewMessage(uint32(n), buffer[0:n])
 				// Get the Request data requested by the current client.
 				// (得到当前客户端请求的Request数据)
-				req := NewRequest(c, msg)
+				req := GetRequest(c, msg)
 				c.msgHandler.Execute(req)
 			}
 		}
@@ -253,7 +274,11 @@ func (c *WsConnection) StartReader() {
 // Start starts the connection and makes it work.
 // (Start 启动连接，让当前连接开始工作)
 func (c *WsConnection) Start() {
-	c.ctx, c.cancel = context.WithCancel(context.Background())
+	ctx := c.ctx
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	c.ctx, c.cancel = context.WithCancel(ctx)
 	// Execute the hook method according to the business needs of creating the connection passed in by the user.
 	// (按照用户传递进来的创建连接时需要处理的业务，执行钩子方法)
 	c.callOnConnStart()
@@ -265,6 +290,9 @@ func (c *WsConnection) Start() {
 		c.updateActivity()
 	}
 
+	// 占用workerid
+	c.workerID = useWorker(c)
+
 	// Start the Goroutine for users to read data from the client.
 	// (开启用户从客户端读取数据流程的Goroutine)
 	go c.StartReader()
@@ -272,6 +300,9 @@ func (c *WsConnection) Start() {
 	select {
 	case <-c.ctx.Done():
 		c.finalizer()
+
+		// 归还workerid
+		freeWorker(c)
 		return
 	}
 }
@@ -299,6 +330,14 @@ func (c *WsConnection) GetConnID() uint64 {
 	return c.connID
 }
 
+func (c *WsConnection) GetConnIdStr() string {
+	return c.connIdStr
+}
+
+func (c *WsConnection) GetWorkerID() uint32 {
+	return c.workerID
+}
+
 func (c *WsConnection) RemoteAddr() net.Addr {
 	return c.conn.RemoteAddr()
 }
@@ -308,8 +347,8 @@ func (c *WsConnection) LocalAddr() net.Addr {
 }
 
 func (c *WsConnection) Send(data []byte) error {
-	c.msgLock.RLock()
-	defer c.msgLock.RUnlock()
+	c.msgLock.Lock()
+	defer c.msgLock.Unlock()
 	if c.isClosed == true {
 		return errors.New("WsConnection closed when send msg")
 	}
@@ -323,9 +362,9 @@ func (c *WsConnection) Send(data []byte) error {
 	return nil
 }
 
-func (c *WsConnection) SendToQueue(data []byte) error {
-	c.msgLock.RLock()
-	defer c.msgLock.RUnlock()
+func (c *WsConnection) SendToQueue(data []byte, opts ...ziface.MsgSendOption) error {
+	c.msgLock.Lock()
+	defer c.msgLock.Unlock()
 
 	if c.msgBuffChan == nil {
 		c.msgBuffChan = make(chan []byte, zconf.GlobalObject.MaxMsgChanLen)
@@ -336,7 +375,15 @@ func (c *WsConnection) SendToQueue(data []byte) error {
 		go c.StartWriter()
 	}
 
-	idleTimeout := time.NewTimer(5 * time.Millisecond)
+	opt := ziface.MsgSendOptionObj{
+		Timeout: 5 * time.Millisecond,
+	}
+
+	for _, o := range opts {
+		o(&opt)
+	}
+
+	idleTimeout := time.NewTimer(opt.Timeout)
 	defer idleTimeout.Stop()
 
 	if c.isClosed == true {
@@ -345,7 +392,7 @@ func (c *WsConnection) SendToQueue(data []byte) error {
 
 	if data == nil {
 		zlog.Ins().ErrorF("Pack data is nil")
-		return errors.New("Pack data is nil")
+		return errors.New("Pack data is nil ")
 	}
 
 	select {
@@ -359,8 +406,8 @@ func (c *WsConnection) SendToQueue(data []byte) error {
 // SendMsg directly sends the Message data to the remote TCP client.
 // (直接将Message数据发送数据给远程的TCP客户端)
 func (c *WsConnection) SendMsg(msgID uint32, data []byte) error {
-	c.msgLock.RLock()
-	defer c.msgLock.RUnlock()
+	c.msgLock.Lock()
+	defer c.msgLock.Unlock()
 	if c.isClosed == true {
 		return errors.New("WsConnection closed when send msg")
 	}
@@ -384,9 +431,9 @@ func (c *WsConnection) SendMsg(msgID uint32, data []byte) error {
 }
 
 // SendBuffMsg sends BuffMsg
-func (c *WsConnection) SendBuffMsg(msgID uint32, data []byte) error {
-	c.msgLock.RLock()
-	defer c.msgLock.RUnlock()
+func (c *WsConnection) SendBuffMsg(msgID uint32, data []byte, opts ...ziface.MsgSendOption) error {
+	c.msgLock.Lock()
+	defer c.msgLock.Unlock()
 
 	if c.msgBuffChan == nil {
 		c.msgBuffChan = make(chan []byte, zconf.GlobalObject.MaxMsgChanLen)
@@ -397,7 +444,15 @@ func (c *WsConnection) SendBuffMsg(msgID uint32, data []byte) error {
 		go c.StartWriter()
 	}
 
-	idleTimeout := time.NewTimer(5 * time.Millisecond)
+	opt := ziface.MsgSendOptionObj{
+		Timeout: 5 * time.Millisecond,
+	}
+
+	for _, o := range opts {
+		o(&opt)
+	}
+
+	idleTimeout := time.NewTimer(opt.Timeout)
 	defer idleTimeout.Stop()
 
 	if c.isClosed == true {
@@ -457,42 +512,52 @@ func (c *WsConnection) Context() context.Context {
 
 func (c *WsConnection) finalizer() {
 	// If the user has registered a close callback for the connection, it should be called explicitly at this moment.
-	// (如果用户注册了该链接的	关闭回调业务，那么在此刻应该显示调用)
+	// (如果用户注册了该连接的	关闭回调业务，那么在此刻应该显示调用)
 	c.callOnConnStop()
 
 	c.msgLock.Lock()
 	defer c.msgLock.Unlock()
 
 	// If the current connection is already closed.
-	// (如果当前链接已经关闭)
+	// (如果当前连接已经关闭)
 	if c.isClosed == true {
 		return
 	}
 
 	// Stop the heartbeat detector bound to the connection.
-	// (关闭链接绑定的心跳检测器)
+	// (关闭连接绑定的心跳检测器)
 	if c.hc != nil {
 		c.hc.Stop()
 	}
 
 	// Close the socket connection.
-	// (关闭socket链接)
+	// (关闭socket连接)
 	_ = c.conn.Close()
 
 	// Remove the connection from the connection manager.
-	// (将链接从连接管理器中删除)
+	// (将连接从连接管理器中删除)
 	if c.connManager != nil {
 		c.connManager.Remove(c)
 	}
 
 	// Close all channels associated with this connection.
-	// (关闭该链接全部管道)
+	// (关闭该连接全部管道)
 	if c.msgBuffChan != nil {
 		close(c.msgBuffChan)
 	}
 
 	// Set the flag to indicate that the connection is closed. (设置标志位)
 	c.isClosed = true
+
+	go func() {
+		defer func() {
+			if err := recover(); err != nil {
+				zlog.Ins().ErrorF("Conn finalizer panic: %v", err)
+			}
+		}()
+
+		c.InvokeCloseCallbacks()
+	}()
 
 	zlog.Ins().InfoF("Conn Stop()...ConnID = %d", c.connID)
 }
@@ -543,4 +608,28 @@ func (c *WsConnection) GetName() string {
 
 func (c *WsConnection) GetMsgHandler() ziface.IMsgHandle {
 	return c.msgHandler
+}
+
+func (s *WsConnection) AddCloseCallback(handler, key interface{}, f func()) {
+	if s.isClosed {
+		return
+	}
+	s.closeCallbackMutex.Lock()
+	defer s.closeCallbackMutex.Unlock()
+	s.closeCallback.Add(handler, key, f)
+}
+
+func (s *WsConnection) RemoveCloseCallback(handler, key interface{}) {
+	if s.isClosed {
+		return
+	}
+	s.closeCallbackMutex.Lock()
+	defer s.closeCallbackMutex.Unlock()
+	s.closeCallback.Remove(handler, key)
+}
+
+func (s *WsConnection) InvokeCloseCallbacks() {
+	s.closeCallbackMutex.RLock()
+	defer s.closeCallbackMutex.RUnlock()
+	s.closeCallback.Invoke()
 }

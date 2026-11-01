@@ -3,9 +3,7 @@
 // @Author Aceld - Thu Mar 11 10:32:29 CST 2019
 package ziface
 
-/*
-	Abstract layer of message management(消息管理抽象层)
-*/
+// IMsgHandle Abstract layer of message management(消息管理抽象层)
 type IMsgHandle interface {
 	// Add specific handling logic for messages, msgID supports int and string types
 	// (为消息添加具体的处理逻辑, msgID，支持整型，字符串)
@@ -24,4 +22,10 @@ type IMsgHandle interface {
 	// the order depends on the registration order
 	// (注册责任链任务入口，每个拦截器处理完后，数据都会传递至下一个拦截器，使得消息可以层层处理层层传递，顺序取决于注册顺序)
 	AddInterceptor(interceptor IInterceptor)
+
+	// SetHeadInterceptor sets the head interceptor of the responsibility chain, which is the first interceptor to be executed
+	// (SetHeadInterceptor 设置责任链的头拦截器，也就是第一个要执行的拦截器)
+	// 默认情况下，责任链的头拦截器是msg decoder
+	// this function will replace the head interceptor
+	SetHeadInterceptor(interceptor IInterceptor)
 }

@@ -35,6 +35,10 @@ func UserConfToGlobal(config *Config) {
 	if config.MaxWorkerTaskLen != 0 {
 		GlobalObject.MaxWorkerTaskLen = config.MaxWorkerTaskLen
 	}
+	if config.WorkerMode != "" {
+		GlobalObject.WorkerMode = config.WorkerMode
+	}
+
 	if config.MaxMsgChanLen != 0 {
 		GlobalObject.MaxMsgChanLen = config.MaxMsgChanLen
 	}
@@ -60,6 +64,15 @@ func UserConfToGlobal(config *Config) {
 		GlobalObject.LogFile = config.LogFile
 		zlog.SetLogFile(GlobalObject.LogDir, GlobalObject.LogFile)
 	}
+	if config.LogSaveDays > 0 {
+		GlobalObject.LogSaveDays = config.LogSaveDays
+	}
+	if config.LogFileSize > 0 {
+		GlobalObject.LogFileSize = config.LogFileSize
+	}
+	if config.LogCons {
+		GlobalObject.LogCons = config.LogCons
+	}
 
 	// Keepalive
 	if config.HeartbeatMax != 0 {
@@ -80,8 +93,60 @@ func UserConfToGlobal(config *Config) {
 	if config.WsPort != 0 {
 		GlobalObject.WsPort = config.WsPort
 	}
+	if config.WsPath != "" {
+		GlobalObject.WsPath = config.WsPath
+	}
 
 	if config.RouterSlicesMode {
 		GlobalObject.RouterSlicesMode = config.RouterSlicesMode
 	}
+
+	if config.RequestPoolMode {
+		GlobalObject.RequestPoolMode = config.RequestPoolMode
+	}
+
+	if config.KcpPort != 0 {
+		GlobalObject.KcpPort = config.KcpPort
+	}
+
+	if config.KcpACKNoDelay {
+		GlobalObject.KcpACKNoDelay = config.KcpACKNoDelay
+	}
+
+	if !config.KcpStreamMode {
+		GlobalObject.KcpStreamMode = config.KcpStreamMode
+	}
+
+	if config.KcpNoDelay != 0 {
+		GlobalObject.KcpNoDelay = config.KcpNoDelay
+	}
+
+	if config.KcpInterval != 0 {
+		GlobalObject.KcpInterval = config.KcpInterval
+	}
+
+	if config.KcpResend != 0 {
+		GlobalObject.KcpResend = config.KcpResend
+	}
+
+	if config.KcpNc != 0 {
+		GlobalObject.KcpNc = config.KcpNc
+	}
+
+	if config.KcpSendWindow != 0 {
+		GlobalObject.KcpSendWindow = config.KcpSendWindow
+	}
+
+	if config.KcpRecvWindow != 0 {
+		GlobalObject.KcpRecvWindow = config.KcpRecvWindow
+	}
+
+	if config.KcpFecDataShards != 0 {
+		GlobalObject.KcpFecDataShards = config.KcpFecDataShards
+	}
+
+	if config.KcpFecParityShards != 0 {
+		GlobalObject.KcpFecParityShards = config.KcpFecParityShards
+	}
+
 }
